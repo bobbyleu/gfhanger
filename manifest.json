@@ -1,0 +1,12 @@
+{
+    "domain": "gfhanger",
+    "name": "格峰晾衣架",
+    "documentation": "https://github.com/bobbyleu/gfhanger",
+    "requirements": [],
+    "dependencies": [],
+    "codeowners": ["bobbyleu"],
+    "version": "1.0.0",
+    "iot_class": "cloud_polling",
+    "config_flow": true,
+    "issue_tracker": "https://your-issue-tracker-url.com"
+}
