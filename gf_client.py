@@ -5,10 +5,9 @@ SEQUENCE_NUMBER = 0
 
 
 class GfClient:
-    def __init__(self, host, port):
+    def __init__(self, host, port, max_retries=3):
         self.host = host
         self.port = port
-        self.token = None
         self.recv_buffer = b""
         self.login_event = asyncio.Event()
         self.control_event = asyncio.Event()
@@ -23,19 +22,28 @@ class GfClient:
         self.operation_success = False
         self.has_printed_login_success = False
         self.should_exit = False
-        # 添加一个锁来控制对 reader.read 的访问
-        self.read_lock = asyncio.Lock()
+        self.max_retries = max_retries
+        # 新增变量，用于判断服务器连接是否断开
+        self.is_connection_closed = False
 
     async def connect(self):
-        try:
-            self.reader, self.writer = await asyncio.open_connection(self.host, self.port)
-            self._log_info(f"已连接到服务器 {self.host}:{self.port}")
-            self.receive_task = asyncio.create_task(self.receive_messages())
-            return True
-        except ConnectionError as e:
-            self._log_error(f"连接服务器失败: {e}")
-            self._exit_program()
-            return False
+        if self.receive_task and not self.receive_task.done():
+            return True  # 已经连接，直接返回
+        retries = 0
+        while retries < self.max_retries:
+            try:
+                self.reader, self.writer = await asyncio.open_connection(self.host, self.port)
+                self._log_info(f"已连接到服务器 {self.host}:{self.port}")
+                self.receive_task = asyncio.create_task(self.receive_messages())
+                self.is_connection_closed = False  # 连接成功，将连接断开标志置为 False
+                return True
+            except ConnectionError as e:
+                self._log_error(f"连接服务器失败: {e}, 重试第 {retries + 1} 次")
+                retries += 1
+        self._log_error("达到最大重试次数，连接失败")
+        self._exit_program()
+        self.is_connection_closed = True  # 连接失败，将连接断开标志置为 True
+        return False
 
     def close(self):
         if self.receive_task:
@@ -44,8 +52,12 @@ class GfClient:
             self.writer.close()
         self._log_info("连接已关闭")
         self._exit_program()
+        self.is_connection_closed = True  # 关闭连接，将连接断开标志置为 True
 
-    async def send_message(self, hex_str, operation=None):
+    async def send_message(self, hex_str, operation=None, retries=0):
+        if self.is_connection_closed:
+            if not await self.connect():
+                return
         try:
             message_bytes = bytes.fromhex(hex_str)
             self.writer.write(message_bytes)
@@ -53,23 +65,31 @@ class GfClient:
             self.last_sent_type = hex_str[:4]
             self.response_received.clear()
             self.last_operation = operation
-            self._log_info(f"发送: {hex_str}")
+            # self._log_info(f"发送: {hex_str}")
         except ValueError as e:
             self._log_error(f"无效的十六进制消息: {hex_str}")
         except ConnectionError as e:
-            self._log_error(f"发送消息时连接错误: {e}")
+            if retries < self.max_retries:
+                self._log_error(f"发送消息时连接错误: {e}, 尝试重新连接并再次发送")
+                if await self.connect():
+                    await self.send_message(hex_str, operation, retries + 1)
+            else:
+                self._log_error("达到最大重试次数，发送消息失败")
+                self._exit_program()
 
     async def receive_messages(self):
         incomplete_message = b""
         while not self.should_exit:
             try:
-                # 使用锁来确保只有一个协程可以调用 reader.read
-                async with self.read_lock:
-                    data = await self.reader.read(4096)
+                if self.is_connection_closed:
+                    break
+                data = await self.reader.read(4096)
                 if not data:
+                    self._log_info("服务器断开连接")
+                    self.is_connection_closed = True  # 服务器断开连接，将连接断开标志置为 True
                     break
                 self.recv_buffer += data
-                self._log_info(f"原始接收: {self.recv_buffer.hex()}")
+                # self._log_info(f"原始接收: {self.recv_buffer.hex()}")
                 while len(self.recv_buffer) > 0:
                     if len(self.recv_buffer) < 4:
                         incomplete_message += self.recv_buffer
@@ -87,7 +107,8 @@ class GfClient:
                         total_length = 4 + data_length
                         if len(self.recv_buffer) >= total_length:
                             message = self.recv_buffer[:total_length]
-                            self.process_complete_message(message)
+                            if not self.is_connection_closed:
+                                self.process_complete_message(message)
                             self.recv_buffer = self.recv_buffer[total_length:]
                             self.response_received.set()
                     else:
@@ -97,11 +118,15 @@ class GfClient:
             except Exception as e:
                 self._log_error(f"接收消息出错: {str(e)}")
 
-        if incomplete_message:
+        if incomplete_message and not self.is_connection_closed:
             self.process_complete_message(incomplete_message)
 
     def process_complete_message(self, message):
         data_type = message[:2].hex()
+        if data_type == "0300":
+            # self._log_info(f"收到 data_type 为 0300 的消息，原始数据: {message.hex()}")
+            return
+
         length_hex = message[2:4].hex()
         data_length = 4 + int(length_hex, 16)
         content = message[4:data_length]
@@ -126,8 +151,8 @@ class GfClient:
                     json_str = content_str[start_index:]
                     try:
                         parsed_content = json.loads(json_str)
-                        if method in ["onHomeInfo", "onLoginInfoEnd", "onDeviceStatusData"]:
-                            self._log_info(f"解析成功: {data_type} 消息解析结果 - 方法: {method}, 内容: {parsed_content}")
+                        # if method in ["onHomeInfo", "onLoginInfoEnd", "onDeviceStatusData"]:
+                        #     self._log_info(f"解析成功: {data_type} 消息解析结果 - 方法: {method}, 内容: {parsed_content}")
 
                         if method == "onHomeInfo":
                             self._process_on_home_info(parsed_content)
@@ -170,12 +195,7 @@ class GfClient:
                                 'status': status,
                                 'position': position
                             })
-        if self.devices_info:
-            self._log_info("从 onHomeInfo 中获取的设备信息：")
-            for i, device_info in enumerate(self.devices_info, start=1):
-                self._log_info(
-                    f"  {i}. e_name: {device_info['e_name']}, _id: {device_info['_id']}, status: {device_info['status']}, position: {device_info['position']}")
-        else:
+        if not self.devices_info:
             self._log_error("未从 onHomeInfo 中获取到设备信息，关闭连接并退出程序")
             self.close()
 
@@ -192,30 +212,27 @@ class GfClient:
             self.close()
 
     def _process_on_device_status_data(self, parsed_content):
-        devices = parsed_content.get('devices', [])
-        if devices:
-            for device in devices:
-                e_name = device.get('e_name')
-                _id = device.get('_id')
-                status = device.get('props', {}).get('status')
-                position = device.get('props', {}).get('position')
-                if self.on_device_status_count == 0:
-                    self._log_info(f"操作前设备状态 - e_name: {e_name}, _id: {_id}, status: {status}, position: {position}")
-                elif self.on_device_status_count == 1:
-                    self._log_info(f"操作后设备状态更新 - e_name: {e_name}, _id: {_id}, status: {status}, position: {position}")
-                    for i, dev in enumerate(self.devices_info):
-                        if dev['_id'] == _id:
-                            self.devices_info[i]['status'] = status
-                            self.devices_info[i]['position'] = position
-                            break
-                    if self.last_operation == 'remote_control' and self.operation_success:
-                        self.control_event.set()
-                        self._log_info("设备操作成功")
-                self.on_device_status_count += 1
+        device = parsed_content.get('devices', [])[0]
+        if device:
+            e_name = device.get('e_name')
+            _id = device.get('_id')
+            status = device.get('props', {}).get('status')
+            position = device.get('props', {}).get('position')
+            self._log_info(f"设备状态 - e_name: {e_name}, _id: {_id}, status: {status}, position: {position}")
+            for i, dev in enumerate(self.devices_info):
+                if dev['_id'] == _id:
+                    self.devices_info[i]['status'] = status
+                    self.devices_info[i]['position'] = position
+                    break
+            if self.last_operation == 'remote_control' and self.operation_success:
+                self.control_event.set()  #此功能会导致不再接收设备操作结果信息，后续再研究如何处理
+                self._log_info("设备操作成功")
         else:
             self._log_info("未获取到设备状态更新信息")
 
     def _process_operation_feedback(self, parsed_content):
+        if self.is_connection_closed:
+            return
         code = parsed_content.get('code')
         codetxt = parsed_content.get('codetxt')
         self._log_info(f"操作反馈信息 - code: {code}, codetxt: {codetxt}")
@@ -241,6 +258,8 @@ class GfClient:
         return f"0400{length_hex}{full_content_hex}"
 
     async def login(self, mobile, password, clientid):
+        if not await self.connect():
+            return False
         await self.send_message(
             "0100003B7B22737973223A7B2276657273696F6E223A22302E332E30222C2274797065223A22756E6974792D736F636B6574227D2C2275736572223A7B7D7D")
         await self.response_received.wait()
@@ -268,19 +287,24 @@ class GfClient:
             self.close()
             return False
 
-    async def remote_control(self, deviceId, operation_code):
+    async def remote_control(self, mobile, password, clientid, deviceId, operation_code, retries=0):
         operation_mapping = {
             1: "putDown",
             2: "raiseUp",
             3: "stop"
         }
         name = operation_mapping.get(operation_code)
-        if not self.login_successful:
-            self._log_error("未登录成功，无法进行远程控制操作。")
-            return False
-        if name is None:
-            self._log_error("无效的操作代号，可选值为 1（putDown）、2（raiseUp）、3（stop）")
-            return False
+
+        # 判断连接是否断开
+        if self.is_connection_closed:
+            self._log_info("连接已断开，尝试重新连接并登录...")
+            if not await self.login(mobile, password, clientid):
+                return False
+
+        # 重置事件
+        self.control_event.clear()
+        self.on_device_status_count = 0
+        self.operation_success = False
 
         method_name = "main.userHandler.remoteControll"
         control_data = {
@@ -290,23 +314,17 @@ class GfClient:
 
         hex_message = self.generate_hex_message(method_name, control_data, is_operation_command=True)
         await self.send_message(hex_message, operation='remote_control')
-        self.on_device_status_count = 0
-        self.operation_success = False
-
-        def check_operation_complete():
-            return self.on_device_status_count > 2 and self.operation_success
 
         try:
-            await asyncio.wait_for(asyncio.create_task(self.wait_for_operation_complete(check_operation_complete)), timeout=10)
+            await asyncio.wait_for(self.control_event.wait(), timeout=10)
             return True
         except asyncio.TimeoutError:
-            self._log_error("操作失败：未收到位置反馈")
-            # self.close()
-            return False
-
-    async def wait_for_operation_complete(self, check_function):
-        while not check_function():
-            await asyncio.sleep(0.1)
+            if retries < self.max_retries:
+                self._log_error(f"操作失败：未收到位置反馈，重试第 {retries + 1} 次")
+                return await self.remote_control(mobile, password, clientid, deviceId, operation_code, retries + 1)
+            else:
+                self._log_error("达到最大重试次数，操作失败")
+                return False
 
     def _log_info(self, message):
         print(f"[注意] {message}")
